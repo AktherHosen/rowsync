@@ -357,7 +357,9 @@ class Rowsync_Plugin {
         $notes_string = '';
         $notes = wc_get_order_notes( array( 'order_id' => $order->get_id() ) );
         foreach ( $notes as $note ) {
-            $notes_string .= wp_strip_all_tags( $note->content ) . ' | ';
+            if ( isset( $note->type ) && $note->type === 'customer' ) {
+                $notes_string .= wp_strip_all_tags( $note->content ) . ' | ';
+            }
         }
 
         return array(
