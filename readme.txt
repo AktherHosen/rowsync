@@ -1,15 +1,15 @@
-=== Rowsync - Export Orders to Google Sheets for WooCommerce ===
+=== Rowsync ===
 Contributors: akther1650
-Tags: woocommerce, google sheets, export, orders, automation, daily sheets, pathao, steadfast
+Tags: woocommerce, google sheets, export, orders, automation
 Requires at least: 5.8
-Tested up to: 6.6
+Tested up to: 7.0
 Requires PHP: 7.4
 Requires Plugins: woocommerce
 Stable tag: 1.0.3
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
-Export WooCommerce orders directly to Google Sheets with one click. Automatically creates daily sheets, prevents duplicate exports, and captures courier tracking IDs. No monthly fees required.
+Export WooCommerce orders directly to Google Sheets with one click. Automatic daily sheets, duplicate prevention, and courier tracking.
 
 == Description ==
 

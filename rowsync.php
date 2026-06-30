@@ -5,7 +5,7 @@
  * Description: Export WooCommerce orders directly to Google Sheets with one click. Automatically creates daily sheets and captures courier tracking IDs. No monthly fees or third-party services required.
  * Version: 1.0.3
  * Requires at least: 5.8
- * Tested up to: 6.6
+ * Tested up to: 7.0
  * Requires PHP: 7.4
  * Requires Plugins: woocommerce
  * Author: Akther Hosen
@@ -57,17 +57,12 @@ class Rowsync_Plugin {
         add_action( 'manage_woocommerce_page_wc-orders_custom_column', array( $this, 'render_export_column_hpos' ), 10, 2 );
 
         add_action( 'before_woocommerce_init', array( $this, 'declare_hpos_compatibility' ) );
-        add_action( 'plugins_loaded', array( $this, 'load_textdomain' ) );
     }
 
     public function declare_hpos_compatibility() {
         if ( class_exists( \Automattic\WooCommerce\Utilities\FeaturesUtil::class ) ) {
             \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility( 'custom_order_tables', __FILE__, true );
         }
-    }
-
-    public function load_textdomain() {
-        load_plugin_textdomain( 'rowsync', false, dirname( plugin_basename( __FILE__ ) ) . '/languages' );
     }
 
     public function activate() {
@@ -144,18 +139,27 @@ class Rowsync_Plugin {
             }
         }
 
-        if ( ! empty( $_FILES['rowsync_json_file']['tmp_name'] ) ) {
-            $file_content = file_get_contents( $_FILES['rowsync_json_file']['tmp_name'] );
-            $decoded = json_decode( $file_content, true );
-            
-            if ( is_array( $decoded ) && isset( $decoded['private_key'], $decoded['client_email'] ) ) {
-                $sanitized['service_account_json'] = $file_content;
-                delete_transient( 'rowsync_google_access_token' );
-                add_settings_error( 'rowsync_settings', 'file_upload_success', 
-                    esc_html__( 'Service account JSON uploaded successfully via file!', 'rowsync' ), 'updated' );
+        if ( ! isset( $_POST['_wpnonce'] ) || ! wp_verify_nonce( sanitize_key( $_POST['_wpnonce'] ), 'rowsync_settings_group-options' ) ) {
+            return $sanitized;
+        }
+
+        if ( ! empty( $_FILES['rowsync_json_file']['tmp_name'] ) ) { // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
+            $tmp_name = wp_unslash( $_FILES['rowsync_json_file']['tmp_name'] ); // phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
+            if ( ! is_uploaded_file( $tmp_name ) ) {
+                add_settings_error( 'rowsync_settings', 'upload_error', esc_html__( 'File upload verification failed.', 'rowsync' ), 'error' );
             } else {
-                add_settings_error( 'rowsync_settings', 'invalid_file', 
-                    esc_html__( 'The uploaded file is not a valid service account JSON.', 'rowsync' ), 'error' );
+                $file_content = file_get_contents( $tmp_name );
+                $decoded = json_decode( $file_content, true );
+
+                if ( is_array( $decoded ) && isset( $decoded['private_key'], $decoded['client_email'] ) ) {
+                    $sanitized['service_account_json'] = $file_content;
+                    delete_transient( 'rowsync_google_access_token' );
+                    add_settings_error( 'rowsync_settings', 'file_upload_success',
+                        esc_html__( 'Service account JSON uploaded successfully via file!', 'rowsync' ), 'updated' );
+                } else {
+                    add_settings_error( 'rowsync_settings', 'invalid_file',
+                        esc_html__( 'The uploaded file is not a valid service account JSON.', 'rowsync' ), 'error' );
+                }
             }
         }
 
@@ -190,6 +194,7 @@ class Rowsync_Plugin {
                     <input type="text" id="rowsync_sheet_id" name="rowsync_settings[sheet_id]"
                         value="<?php echo esc_attr( $sheet_id ); ?>" class="regular-text" required>
                     <p class="description">
+                        <?php /* translators: %s: Google Sheets URL example showing where the Sheet ID appears */ ?>
                         <?php printf( esc_html__( 'From your sheet URL: %s', 'rowsync' ), '<code>docs.google.com/spreadsheets/d/<strong>THIS_PART</strong>/edit</code>' ); ?>
                     </p>
                 </td>
@@ -227,9 +232,11 @@ class Rowsync_Plugin {
                     <p class="description">
                         <?php if ( $has_key ) : ?>
                         <span style="color: #46b450;">✓
+                            <?php /* translators: %s: Service account email address */ ?>
                             <?php printf( esc_html__( 'Saved for: %s', 'rowsync' ), '<code>' . esc_html( $client_email ) . '</code>' ); ?></span>
                         <?php endif; ?>
-                        <br><?php printf( esc_html__( 'Share your Google Sheet with %s as Editor.', 'rowsync' ), '<code>' . ( $has_key ? esc_html( $client_email ) : 'client_email' ) . '</code>' ); ?>
+                        <br><?php /* translators: %s: Service account email address */ ?>
+                        <?php printf( esc_html__( 'Share your Google Sheet with %s as Editor.', 'rowsync' ), '<code>' . ( $has_key ? esc_html( $client_email ) : 'client_email' ) . '</code>' ); ?>
                     </p>
                 </td>
             </tr>
@@ -295,14 +302,14 @@ class Rowsync_Plugin {
     }
 
     public function handle_export() {
-        if ( ! isset( $_GET['_wpnonce'] ) || ! wp_verify_nonce( sanitize_key( $_GET['_wpnonce'] ), 'rowsync_export_' . absint( $_GET['order_id'] ) ) ) {
+        $order_id = isset( $_GET['order_id'] ) ? absint( $_GET['order_id'] ) : 0;
+        if ( ! $order_id || ! isset( $_GET['_wpnonce'] ) || ! wp_verify_nonce( sanitize_key( $_GET['_wpnonce'] ), 'rowsync_export_' . $order_id ) ) {
             wp_die( esc_html__( 'Security check failed.', 'rowsync' ) );
         }
         if ( ! current_user_can( 'edit_shop_orders' ) ) {
             wp_die( esc_html__( 'You do not have permission to export orders.', 'rowsync' ) );
         }
 
-        $order_id = absint( $_GET['order_id'] );
         $order = wc_get_order( $order_id );
         if ( ! $order ) wp_die( esc_html__( 'Order not found.', 'rowsync' ) );
 
@@ -420,7 +427,8 @@ class Rowsync_Plugin {
 
         $code = wp_remote_retrieve_response_code( $response );
         if ( $code < 200 || $code >= 300 ) {
-            return new WP_Error( 'api_error', sprintf( esc_html__( 'Google Sheets API error: HTTP %d - %s', 'rowsync' ), $code, wp_remote_retrieve_body( $response ) ) );
+            /* translators: 1: HTTP status code, 2: Error message body */
+            return new WP_Error( 'api_error', sprintf( esc_html__( 'Google Sheets API error: HTTP %1$d - %2$s', 'rowsync' ), $code, wp_remote_retrieve_body( $response ) ) );
         }
 
         return true;
@@ -569,6 +577,7 @@ class Rowsync_Plugin {
 
         if ( $code < 200 || $code >= 300 || empty( $body['access_token'] ) ) {
             $error_msg = isset( $body['error_description'] ) ? $body['error_description'] : wp_remote_retrieve_body( $response );
+            /* translators: %s: Error description from Google API */
             return new WP_Error( 'token_error', sprintf( esc_html__( 'Google API error: %s', 'rowsync' ), $error_msg ) );
         }
 
