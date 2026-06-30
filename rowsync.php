@@ -1,477 +1,641 @@
 <?php
 /**
- * Plugin Name: Rowsync
- * Plugin URI:  https://github.com/yourusername/rowsync
- * Description: Adds an export button to each WooCommerce order row that appends order data directly to a Google Sheet via the Google Sheets API — no third-party connector service required.
- * Version:     1.0.0
- * Author:      Your Name
- * Author URI:  https://github.com/yourusername
- * License:     GPL-2.0-or-later
+ * Plugin Name: Rowsync - WooCommerce to Google Sheets
+ * Plugin URI: https://wordpress.org/plugins/rowsync/
+ * Description: Export WooCommerce orders directly to Google Sheets with one click. Automatically creates daily sheets and captures courier tracking IDs. No monthly fees or third-party services required.
+ * Version: 1.0.3
+ * Requires at least: 5.8
+ * Requires PHP: 7.4
+ * Author: Your Name
+ * Author URI: https://yourwebsite.com
+ * License: GPL v2 or later
  * License URI: https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain: rowsync
- * Requires at least: 6.0
- * Requires PHP: 7.4
- *
- * Rowsync is free software: you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation, either version 2 of the License, or
- * any later version.
+ * Domain Path: /languages
+ * WC requires at least: 5.0
+ * WC tested up to: 8.0
  */
 
-if ( ! defined( 'ABSPATH' ) ) exit;
-
-define( 'ROWSYNC_VERSION', '1.0.0' );
-
-// ==========================================
-// 1. SETTINGS PAGE
-// ==========================================
-add_action( 'admin_menu', 'rowsync_register_settings_page' );
-function rowsync_register_settings_page() {
-    add_options_page(
-        __( 'Rowsync Settings', 'rowsync' ),
-        __( 'Rowsync', 'rowsync' ),
-        'manage_woocommerce',
-        'rowsync-settings',
-        'rowsync_settings_page_html'
-    );
+if ( ! defined( 'ABSPATH' ) ) {
+    exit; // Exit if accessed directly
 }
 
-function rowsync_settings_page_html() {
-    if ( ! current_user_can( 'manage_woocommerce' ) ) return;
+define( 'ROWSYNC_VERSION', '1.0.3' );
+define( 'ROWSYNC_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
+define( 'ROWSYNC_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 
-    if ( isset( $_POST['rowsync_save_settings'] ) && check_admin_referer( 'rowsync_save_nonce' ) ) {
-        update_option( 'rowsync_sheet_id', sanitize_text_field( wp_unslash( $_POST['rowsync_sheet_id'] ?? '' ) ) );
-        update_option( 'rowsync_sheet_tab', sanitize_text_field( wp_unslash( $_POST['rowsync_sheet_tab'] ?? '' ) ) );
-        update_option( 'rowsync_debug_mode', isset( $_POST['rowsync_debug_mode'] ) ? 1 : 0 );
+class Rowsync_Plugin {
+    private static $instance = null;
 
-        // Configurable courier meta keys -- this is what makes the plugin work for ANY courier setup
-        update_option( 'rowsync_courier_meta_keys', sanitize_text_field( wp_unslash( $_POST['rowsync_courier_meta_keys'] ?? '' ) ) );
+    public static function get_instance() {
+        if ( null === self::$instance ) {
+            self::$instance = new self();
+        }
+        return self::$instance;
+    }
 
-        // Only overwrite the stored key if something new was pasted in (textarea shown blank on reload for security)
-        if ( ! empty( $_POST['rowsync_service_account_json'] ) ) {
-            $json_raw = wp_unslash( $_POST['rowsync_service_account_json'] );
-            $decoded  = json_decode( $json_raw, true );
-            if ( is_array( $decoded ) && isset( $decoded['private_key'], $decoded['client_email'] ) ) {
-                update_option( 'rowsync_service_account_json', $json_raw, false ); // false = don't autoload, it's sensitive
-                delete_transient( 'rowsync_google_access_token' ); // force fresh token next export
-                echo '<div class="notice notice-success"><p>' . esc_html__( 'Settings saved! New service account key stored.', 'rowsync' ) . '</p></div>';
-            } else {
-                echo '<div class="notice notice-error"><p>' . esc_html__( "That didn't look like a valid service account JSON file (missing private_key or client_email). Key was NOT saved — please re-paste it.", 'rowsync' ) . '</p></div>';
-            }
-        } else {
-            echo '<div class="notice notice-success"><p>' . esc_html__( 'Settings saved!', 'rowsync' ) . '</p></div>';
+    private function __construct() {
+        $this->init_hooks();
+    }
+
+    private function init_hooks() {
+        register_activation_hook( __FILE__, array( $this, 'activate' ) );
+        register_deactivation_hook( __FILE__, array( $this, 'deactivate' ) );
+
+        add_action( 'admin_menu', array( $this, 'add_settings_page' ) );
+        add_action( 'admin_init', array( $this, 'register_settings' ) );
+        add_action( 'admin_post_rowsync_export_order', array( $this, 'handle_export' ) );
+        add_action( 'admin_notices', array( $this, 'admin_notices' ) );
+        add_action( 'admin_footer', array( $this, 'admin_scripts' ) );
+
+        add_filter( 'manage_edit-shop_order_columns', array( $this, 'add_export_column' ) );
+        add_action( 'manage_shop_order_posts_custom_column', array( $this, 'render_export_column' ), 10, 2 );
+        
+        add_filter( 'manage_woocommerce_page_wc-orders_columns', array( $this, 'add_export_column' ) );
+        add_action( 'manage_woocommerce_page_wc-orders_custom_column', array( $this, 'render_export_column_hpos' ), 10, 2 );
+
+        add_action( 'before_woocommerce_init', array( $this, 'declare_hpos_compatibility' ) );
+        add_action( 'plugins_loaded', array( $this, 'load_textdomain' ) );
+    }
+
+    public function declare_hpos_compatibility() {
+        if ( class_exists( \Automattic\WooCommerce\Utilities\FeaturesUtil::class ) ) {
+            \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility( 'custom_order_tables', __FILE__, true );
         }
     }
 
-    $sheet_id     = get_option( 'rowsync_sheet_id', '' );
-    $sheet_tab    = get_option( 'rowsync_sheet_tab', 'Sheet1' );
-    $debug_mode   = get_option( 'rowsync_debug_mode', 0 );
-    $courier_keys = get_option( 'rowsync_courier_meta_keys', '' );
-    $has_key      = ! empty( get_option( 'rowsync_service_account_json', '' ) );
-    $client_email = '';
-    if ( $has_key ) {
-        $decoded      = json_decode( get_option( 'rowsync_service_account_json' ), true );
-        $client_email = $decoded['client_email'] ?? '';
+    public function load_textdomain() {
+        load_plugin_textdomain( 'rowsync', false, dirname( plugin_basename( __FILE__ ) ) . '/languages' );
     }
-    ?>
+
+    public function activate() {
+        if ( ! class_exists( 'WooCommerce' ) ) {
+            deactivate_plugins( plugin_basename( __FILE__ ) );
+            wp_die( esc_html__( 'Rowsync requires WooCommerce to be installed and active.', 'rowsync' ), esc_html__( 'Plugin Activation Error', 'rowsync' ), array( 'back_link' => true ) );
+        }
+        if ( ! function_exists( 'openssl_sign' ) ) {
+            deactivate_plugins( plugin_basename( __FILE__ ) );
+            wp_die( esc_html__( 'Rowsync requires the PHP OpenSSL extension.', 'rowsync' ), esc_html__( 'Plugin Activation Error', 'rowsync' ), array( 'back_link' => true ) );
+        }
+
+        if ( ! get_option( 'rowsync_settings' ) ) {
+            add_option( 'rowsync_settings', array(
+                'sheet_id' => '',
+                'debug_mode' => 0,
+                'courier_meta_keys' => 'ptc_consignment_id, steadfast_consignment_id, _steadfast_consignment_id',
+            ) );
+        }
+    }
+
+    public function deactivate() {
+        delete_transient( 'rowsync_google_access_token' );
+        delete_transient( 'rowsync_export_success' );
+        delete_transient( 'rowsync_export_error' );
+    }
+
+    public function add_settings_page() {
+        add_options_page(
+            esc_html__( 'Rowsync Settings', 'rowsync' ),
+            esc_html__( 'Rowsync', 'rowsync' ),
+            'manage_woocommerce',
+            'rowsync-settings',
+            array( $this, 'render_settings_page' )
+        );
+    }
+
+    public function register_settings() {
+        register_setting( 'rowsync_settings_group', 'rowsync_settings', array(
+            'type' => 'array',
+            'sanitize_callback' => array( $this, 'sanitize_settings' ),
+        ) );
+    }
+
+    public function sanitize_settings( $input ) {
+        $sanitized = array();
+        
+        if ( isset( $input['sheet_id'] ) ) {
+            $sanitized['sheet_id'] = sanitize_text_field( $input['sheet_id'] );
+        }
+        
+        if ( isset( $input['debug_mode'] ) ) {
+            $sanitized['debug_mode'] = absint( $input['debug_mode'] );
+        }
+        
+        if ( isset( $input['courier_meta_keys'] ) ) {
+            $sanitized['courier_meta_keys'] = sanitize_text_field( $input['courier_meta_keys'] );
+        }
+
+        if ( ! empty( $input['service_account_json'] ) ) {
+            $json_raw = trim( wp_unslash( $input['service_account_json'] ) );
+            $decoded = json_decode( $json_raw, true );
+            
+            if ( is_array( $decoded ) && isset( $decoded['private_key'], $decoded['client_email'] ) ) {
+                $sanitized['service_account_json'] = $json_raw;
+                delete_transient( 'rowsync_google_access_token' );
+            } else {
+                add_settings_error( 'rowsync_settings', 'invalid_json', 
+                    esc_html__( 'Invalid service account JSON. Please check and try again.', 'rowsync' ), 'error' );
+                $old_settings = get_option( 'rowsync_settings', array() );
+                if ( isset( $old_settings['service_account_json'] ) ) {
+                    $sanitized['service_account_json'] = $old_settings['service_account_json'];
+                }
+            }
+        }
+
+        if ( ! empty( $_FILES['rowsync_json_file']['tmp_name'] ) ) {
+            $file_content = file_get_contents( $_FILES['rowsync_json_file']['tmp_name'] );
+            $decoded = json_decode( $file_content, true );
+            
+            if ( is_array( $decoded ) && isset( $decoded['private_key'], $decoded['client_email'] ) ) {
+                $sanitized['service_account_json'] = $file_content;
+                delete_transient( 'rowsync_google_access_token' );
+                add_settings_error( 'rowsync_settings', 'file_upload_success', 
+                    esc_html__( 'Service account JSON uploaded successfully via file!', 'rowsync' ), 'updated' );
+            } else {
+                add_settings_error( 'rowsync_settings', 'invalid_file', 
+                    esc_html__( 'The uploaded file is not a valid service account JSON.', 'rowsync' ), 'error' );
+            }
+        }
+
+        return $sanitized;
+    }
+
+    public function render_settings_page() {
+        if ( ! current_user_can( 'manage_woocommerce' ) ) return;
+
+        $settings = get_option( 'rowsync_settings', array() );
+        $sheet_id = isset( $settings['sheet_id'] ) ? $settings['sheet_id'] : '';
+        $debug_mode = isset( $settings['debug_mode'] ) ? $settings['debug_mode'] : 0;
+        $courier_keys = isset( $settings['courier_meta_keys'] ) ? $settings['courier_meta_keys'] : '';
+        $has_key = ! empty( $settings['service_account_json'] );
+        $client_email = '';
+        
+        if ( $has_key ) {
+            $decoded = json_decode( $settings['service_account_json'], true );
+            $client_email = isset( $decoded['client_email'] ) ? $decoded['client_email'] : '';
+        }
+        ?>
 <div class="wrap">
-    <h1><?php esc_html_e( 'Rowsync Settings', 'rowsync' ); ?></h1>
-    <form method="POST" action="">
-        <?php wp_nonce_field( 'rowsync_save_nonce' ); ?>
+    <h1><?php echo esc_html( get_admin_page_title() ); ?></h1>
+
+    <form method="post" action="options.php" enctype="multipart/form-data">
+        <?php settings_fields( 'rowsync_settings_group' ); ?>
         <table class="form-table">
             <tr>
                 <th scope="row"><label
                         for="rowsync_sheet_id"><?php esc_html_e( 'Google Sheet ID', 'rowsync' ); ?></label></th>
                 <td>
-                    <input type="text" id="rowsync_sheet_id" name="rowsync_sheet_id"
+                    <input type="text" id="rowsync_sheet_id" name="rowsync_settings[sheet_id]"
                         value="<?php echo esc_attr( $sheet_id ); ?>" class="regular-text" required>
                     <p class="description">
-                        <?php esc_html_e( 'From your sheet URL: docs.google.com/spreadsheets/d/THIS_PART/edit', 'rowsync' ); ?>
+                        <?php printf( esc_html__( 'From your sheet URL: %s', 'rowsync' ), '<code>docs.google.com/spreadsheets/d/<strong>THIS_PART</strong>/edit</code>' ); ?>
                     </p>
                 </td>
             </tr>
             <tr>
                 <th scope="row"><label
-                        for="rowsync_sheet_tab"><?php esc_html_e( 'Sheet/Tab Name', 'rowsync' ); ?></label></th>
-                <td>
-                    <input type="text" id="rowsync_sheet_tab" name="rowsync_sheet_tab"
-                        value="<?php echo esc_attr( $sheet_tab ); ?>" class="regular-text" required>
-                    <p class="description">
-                        <?php esc_html_e( 'The tab name at the bottom of your sheet, e.g. Sheet1', 'rowsync' ); ?></p>
-                </td>
-            </tr>
-            <tr>
-                <th scope="row"><label
-                        for="rowsync_courier_meta_keys"><?php esc_html_e( 'Courier Consignment ID Meta Key(s)', 'rowsync' ); ?></label>
+                        for="rowsync_courier_meta_keys"><?php esc_html_e( 'Courier Meta Keys', 'rowsync' ); ?></label>
                 </th>
                 <td>
-                    <input type="text" id="rowsync_courier_meta_keys" name="rowsync_courier_meta_keys"
+                    <input type="text" id="rowsync_courier_meta_keys" name="rowsync_settings[courier_meta_keys]"
                         value="<?php echo esc_attr( $courier_keys ); ?>" class="regular-text"
-                        placeholder="e.g. ptc_consignment_id, _steadfast_consignment_id">
+                        placeholder="ptc_consignment_id, steadfast_consignment_id">
                     <p class="description">
-                        <?php esc_html_e( 'Comma-separated list of order meta keys your courier plugin(s) use to store the consignment/tracking ID. Rowsync checks each one in order and uses the first non-empty value found.', 'rowsync' ); ?>
-                        <br><?php esc_html_e( 'Common examples: ptc_consignment_id (Pathao Courier), _steadfast_consignment_id (Steadfast). Check your courier plugin\'s documentation or database if unsure.', 'rowsync' ); ?>
+                        <?php esc_html_e( 'Comma-separated list of meta keys for courier tracking IDs.', 'rowsync' ); ?>
                     </p>
                 </td>
             </tr>
             <tr>
-                <th scope="row"><label
-                        for="rowsync_service_account_json"><?php esc_html_e( 'Service Account JSON Key', 'rowsync' ); ?></label>
-                </th>
+                <th scope="row"><label><?php esc_html_e( 'Service Account JSON', 'rowsync' ); ?></label></th>
                 <td>
-                    <textarea id="rowsync_service_account_json" name="rowsync_service_account_json"
+                    <h4><?php esc_html_e( 'Option 1: Upload JSON File (Recommended)', 'rowsync' ); ?></h4>
+                    <p class="description">
+                        <?php esc_html_e( 'This bypasses any security plugins that might break pasted text.', 'rowsync' ); ?>
+                    </p>
+                    <input type="file" name="rowsync_json_file" accept=".json" style="margin-bottom: 15px;">
+
+                    <h4><?php esc_html_e( 'Option 2: Paste JSON Manually', 'rowsync' ); ?></h4>
+                    <textarea id="rowsync_service_account_json" name="rowsync_settings[service_account_json]"
                         class="large-text code" rows="8"
-                        placeholder="<?php echo $has_key ? esc_attr__( 'A key is already saved. Paste a new one only to replace it.', 'rowsync' ) : esc_attr__( 'Paste the full contents of your downloaded service account JSON file here', 'rowsync' ); ?>"></textarea>
+                        placeholder="<?php echo $has_key ? esc_attr__( 'Key already saved. Paste new JSON to replace.', 'rowsync' ) : esc_attr__( 'Paste your service account JSON here', 'rowsync' ); ?>"><?php 
+                                if ( $has_key ) {
+                                    echo esc_textarea( $settings['service_account_json'] );
+                                }
+                            ?></textarea>
                     <p class="description">
                         <?php if ( $has_key ) : ?>
-                        <span style="color:#2271b1;">&#10003; <?php
-                                    /* translators: %s: service account email address */
-                                    printf( esc_html__( 'A service account key is currently saved (%s).', 'rowsync' ), '<code>' . esc_html( $client_email ) . '</code>' );
-                                ?></span>
-                        <?php esc_html_e( 'Leave this blank to keep it, or paste a new JSON file to replace it.', 'rowsync' ); ?>
-                        <?php else : ?>
-                        <?php esc_html_e( 'No key saved yet. Paste the full contents of your downloaded .json file.', 'rowsync' ); ?>
+                        <span style="color: #46b450;">✓
+                            <?php printf( esc_html__( 'Saved for: %s', 'rowsync' ), '<code>' . esc_html( $client_email ) . '</code>' ); ?></span>
                         <?php endif; ?>
-                        <br><?php
-                                $email_display = $has_key ? esc_html( $client_email ) : esc_html__( 'the client_email from your JSON key', 'rowsync' );
-                                /* translators: %s: service account email or placeholder text */
-                                printf( esc_html__( "Don't forget: share your Google Sheet with %s as Editor.", 'rowsync' ), '<code>' . $email_display . '</code>' );
-                            ?>
+                        <br><?php printf( esc_html__( 'Share your Google Sheet with %s as Editor.', 'rowsync' ), '<code>' . ( $has_key ? esc_html( $client_email ) : 'client_email' ) . '</code>' ); ?>
                     </p>
                 </td>
             </tr>
             <tr>
-                <th scope="row"><label
-                        for="rowsync_debug_mode"><?php esc_html_e( 'Enable Debug Mode', 'rowsync' ); ?></label></th>
+                <th scope="row"><label for="rowsync_debug_mode"><?php esc_html_e( 'Debug Mode', 'rowsync' ); ?></label>
+                </th>
                 <td>
-                    <label><input type="checkbox" id="rowsync_debug_mode" name="rowsync_debug_mode" value="1"
-                            <?php checked( 1, $debug_mode ); ?>>
-                        <?php esc_html_e( 'Show exact API errors and JSON payload on screen', 'rowsync' ); ?></label>
+                    <label><input type="checkbox" id="rowsync_debug_mode" name="rowsync_settings[debug_mode]" value="1"
+                            <?php checked( $debug_mode, 1 ); ?>>
+                        <?php esc_html_e( 'Enable debug output', 'rowsync' ); ?></label>
                     <p class="description">
-                        <?php esc_html_e( 'Turn this on if the sheet is still empty. It will show you exactly what the API is rejecting.', 'rowsync' ); ?>
-                    </p>
+                        <?php esc_html_e( 'Show detailed API errors and payloads when exporting.', 'rowsync' ); ?></p>
                 </td>
             </tr>
         </table>
-        <p class="submit"><input type="submit" name="rowsync_save_settings" class="button-primary"
-                value="<?php esc_attr_e( 'Save Settings', 'rowsync' ); ?>"></p>
+        <?php submit_button(); ?>
     </form>
 
     <hr>
-    <h2><?php esc_html_e( 'Your Google Sheet Row 1 MUST match these exact headers, in this order:', 'rowsync' ); ?></h2>
-    <p style="background:#f0f0f1; padding:10px; font-family:monospace;">
-        Order ID | Date | Customer Name | Phone | Address | Items &amp; Quantity | Order Notes | Amount | Delivery
+    <h2><?php esc_html_e( 'Required Sheet Headers', 'rowsync' ); ?></h2>
+    <p><?php esc_html_e( 'Your Google Sheet must have these headers in Row 1 (exact order):', 'rowsync' ); ?></p>
+    <div
+        style="background: #f0f0f1; padding: 15px; font-family: monospace; font-size: 13px; border-left: 4px solid #2271b1;">
+        Order ID | Date | Customer Name | Phone | Address | Items &amp; Quantity | Order Notes | Amount (BDT) | Delivery
         Charge | Courier ID
-    </p>
-    <p><?php esc_html_e( 'This plugin appends rows by column position (A:J), so the header text itself does not need to match exactly — but the column order does.', 'rowsync' ); ?>
-    </p>
+    </div>
 </div>
 <?php
-}
-
-// ==========================================
-// 2. ADD THE EXPORT BUTTON (HPOS & LEGACY)
-// ==========================================
-add_filter( 'manage_edit-shop_order_columns', 'rowsync_add_export_column' );
-add_action( 'manage_shop_order_posts_custom_column', 'rowsync_render_export_column', 10, 2 );
-add_filter( 'manage_woocommerce_page_wc-orders_columns', 'rowsync_add_export_column' );
-add_action( 'manage_woocommerce_page_wc-orders_custom_column', 'rowsync_render_export_column_hpos', 10, 2 );
-
-function rowsync_add_export_column( $columns ) {
-    $columns['rowsync_export'] = __( 'Export to Sheet', 'rowsync' );
-    return $columns;
-}
-
-function rowsync_render_export_column( $column, $post_id ) {
-    if ( $column === 'rowsync_export' ) rowsync_output_button( $post_id );
-}
-
-function rowsync_render_export_column_hpos( $column, $order ) {
-    if ( $column === 'rowsync_export' ) rowsync_output_button( $order->get_id() );
-}
-
-function rowsync_output_button( $order_id ) {
-    if ( ! current_user_can( 'edit_shop_orders' ) ) return;
-    $nonce = wp_create_nonce( 'rowsync_export_nonce_' . $order_id );
-    $url   = admin_url( 'admin-post.php?action=rowsync_send_to_sheet&order_id=' . absint( $order_id ) . '&_wpnonce=' . $nonce );
-    echo '<a href="' . esc_url( $url ) . '" class="button button-primary rowsync-export-btn">' . esc_html__( 'Export', 'rowsync' ) . '</a>';
-}
-
-// ==========================================
-// 3. GOOGLE AUTH HELPERS (pure PHP, no Composer)
-// ==========================================
-
-/**
- * Base64url encode (Google/JWT use URL-safe base64, no padding)
- */
-function rowsync_base64url_encode( $data ) {
-    return rtrim( strtr( base64_encode( $data ), '+/', '-_' ), '=' );
-}
-
-/**
- * Build and sign a JWT for Google's OAuth2 service-account flow,
- * then exchange it for a short-lived access token.
- * Returns the access token string, or a WP_Error on failure.
- */
-function rowsync_get_google_access_token() {
-    // Reuse cached token if still valid (Google tokens last 1hr; we cache 55 min to be safe)
-    $cached = get_transient( 'rowsync_google_access_token' );
-    if ( $cached ) return $cached;
-
-    $json_raw = get_option( 'rowsync_service_account_json', '' );
-    if ( empty( $json_raw ) ) {
-        return new WP_Error( 'no_key', __( 'No service account JSON key saved in plugin settings.', 'rowsync' ) );
     }
 
-    $creds = json_decode( $json_raw, true );
-    if ( ! is_array( $creds ) || empty( $creds['private_key'] ) || empty( $creds['client_email'] ) || empty( $creds['token_uri'] ) ) {
-        return new WP_Error( 'bad_key', __( 'Service account JSON is missing required fields (private_key, client_email, token_uri).', 'rowsync' ) );
+    public function add_export_column( $columns ) {
+        $new_columns = array();
+        foreach ( $columns as $key => $name ) {
+            $new_columns[ $key ] = $name;
+            if ( 'order_status' === $key ) {
+                $new_columns['rowsync_export'] = esc_html__( 'Export', 'rowsync' );
+            }
+        }
+        return $new_columns;
     }
 
-    $now    = time();
-    $header = [ 'alg' => 'RS256', 'typ' => 'JWT' ];
-    $claims = [
-        'iss'   => $creds['client_email'],
-        'scope' => 'https://www.googleapis.com/auth/spreadsheets',
-        'aud'   => $creds['token_uri'],
-        'exp'   => $now + 3600,
-        'iat'   => $now,
-    ];
-
-    $segments = [
-        rowsync_base64url_encode( wp_json_encode( $header ) ),
-        rowsync_base64url_encode( wp_json_encode( $claims ) ),
-    ];
-    $signing_input = implode( '.', $segments );
-
-    $private_key = openssl_pkey_get_private( $creds['private_key'] );
-    if ( ! $private_key ) {
-        return new WP_Error( 'bad_private_key', __( 'Could not parse the private_key from the service account JSON.', 'rowsync' ) );
+    public function render_export_column( $column, $post_id ) {
+        if ( 'rowsync_export' === $column ) $this->render_export_button( $post_id );
     }
 
-    $signature = '';
-    $signed_ok = openssl_sign( $signing_input, $signature, $private_key, OPENSSL_ALGO_SHA256 );
-
-    if ( ! $signed_ok ) {
-        return new WP_Error( 'sign_fail', __( 'Failed to sign JWT with the provided private key.', 'rowsync' ) );
+    public function render_export_column_hpos( $column, $order ) {
+        if ( 'rowsync_export' === $column ) $this->render_export_button( $order->get_id() );
     }
 
-    $jwt = $signing_input . '.' . rowsync_base64url_encode( $signature );
+    private function render_export_button( $order_id ) {
+        $order = wc_get_order( $order_id );
+        if ( ! $order ) return;
 
-    // Exchange JWT for access token
-    $response = wp_remote_post( $creds['token_uri'], [
-        'method'  => 'POST',
-        'headers' => [ 'Content-Type' => 'application/x-www-form-urlencoded' ],
-        'body'    => [
-            'grant_type' => 'urn:ietf:params:oauth:grant-type:jwt-bearer',
-            'assertion'  => $jwt,
-        ],
-        'timeout' => 15,
-    ] );
-
-    if ( is_wp_error( $response ) ) {
-        return $response;
-    }
-
-    $code = wp_remote_retrieve_response_code( $response );
-    $body = json_decode( wp_remote_retrieve_body( $response ), true );
-
-    if ( $code < 200 || $code >= 300 || empty( $body['access_token'] ) ) {
-        $error_detail = isset( $body['error_description'] ) ? $body['error_description'] : wp_remote_retrieve_body( $response );
-        /* translators: 1: HTTP status code, 2: error detail from Google */
-        return new WP_Error( 'token_fail', sprintf( __( 'Google rejected the token request (HTTP %1$s): %2$s', 'rowsync' ), $code, $error_detail ) );
-    }
-
-    $access_token = $body['access_token'];
-    $expires_in   = isset( $body['expires_in'] ) ? (int) $body['expires_in'] : 3600;
-
-    // Cache for slightly less than the actual expiry
-    set_transient( 'rowsync_google_access_token', $access_token, max( 60, $expires_in - 300 ) );
-
-    return $access_token;
-}
-
-/**
- * Append one row to the configured Google Sheet.
- * $row_values must be a plain array in column A->... order.
- * Returns true on success, or a WP_Error on failure.
- */
-function rowsync_append_row_to_sheet( $row_values ) {
-    $sheet_id  = get_option( 'rowsync_sheet_id', '' );
-    $sheet_tab = get_option( 'rowsync_sheet_tab', 'Sheet1' );
-
-    if ( empty( $sheet_id ) ) {
-        return new WP_Error( 'no_sheet_id', __( 'No Google Sheet ID configured in plugin settings.', 'rowsync' ) );
-    }
-
-    $token = rowsync_get_google_access_token();
-    if ( is_wp_error( $token ) ) {
-        return $token;
-    }
-
-    $range = rawurlencode( $sheet_tab . '!A:J' );
-    $url   = "https://sheets.googleapis.com/v4/spreadsheets/{$sheet_id}/values/{$range}:append"
-           . '?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS';
-
-    $body = wp_json_encode( [
-        'values' => [ array_values( $row_values ) ],
-    ] );
-
-    $response = wp_remote_post( $url, [
-        'method'  => 'POST',
-        'headers' => [
-            'Content-Type'  => 'application/json',
-            'Authorization' => 'Bearer ' . $token,
-        ],
-        'body'    => $body,
-        'timeout' => 15,
-    ] );
-
-    if ( is_wp_error( $response ) ) {
-        return $response;
-    }
-
-    $code      = wp_remote_retrieve_response_code( $response );
-    $resp_body = wp_remote_retrieve_body( $response );
-
-    if ( $code < 200 || $code >= 300 ) {
-        /* translators: 1: HTTP status code, 2: response body from Google */
-        return new WP_Error( 'append_fail', sprintf( __( 'Google Sheets API returned HTTP %1$s: %2$s', 'rowsync' ), $code, $resp_body ) );
-    }
-
-    return true;
-}
-
-// ==========================================
-// 4. HANDLE EXPORT BUTTON CLICK
-// ==========================================
-add_action( 'admin_post_rowsync_send_to_sheet', 'rowsync_process_export' );
-function rowsync_process_export() {
-    if ( ! isset( $_GET['order_id'] ) || ! isset( $_GET['_wpnonce'] ) ) {
-        wp_die( esc_html__( 'Invalid request.', 'rowsync' ) );
-    }
-
-    $order_id = absint( $_GET['order_id'] );
-    $nonce    = sanitize_text_field( wp_unslash( $_GET['_wpnonce'] ) );
-
-    if ( ! wp_verify_nonce( $nonce, 'rowsync_export_nonce_' . $order_id ) ) {
-        wp_die( esc_html__( 'Security check failed.', 'rowsync' ) );
-    }
-    if ( ! current_user_can( 'edit_shop_orders' ) ) {
-        wp_die( esc_html__( 'You do not have permission to do this.', 'rowsync' ) );
-    }
-
-    $order = wc_get_order( $order_id );
-    if ( ! $order ) {
-        wp_die( esc_html__( 'Order not found.', 'rowsync' ) );
-    }
-
-    $is_debug = get_option( 'rowsync_debug_mode', 0 );
-
-    // 1. Gather order line items
-    $items_string = '';
-    foreach ( $order->get_items() as $item ) {
-        $items_string .= $item->get_name() . ' x' . $item->get_quantity() . '; ';
-    }
-
-    // 2. Gather order notes
-    $notes        = wc_get_order_notes( [ 'order_id' => $order_id ] );
-    $notes_string = '';
-    foreach ( $notes as $note ) {
-        $notes_string .= wp_strip_all_tags( $note->content ) . ' | ';
-    }
-
-    // 3. Resolve courier consignment ID from user-configured meta keys
-    $courier_id        = '';
-    $courier_keys_raw  = get_option( 'rowsync_courier_meta_keys', '' );
-    $courier_keys      = array_filter( array_map( 'trim', explode( ',', $courier_keys_raw ) ) );
-    foreach ( $courier_keys as $meta_key ) {
-        $value = $order->get_meta( $meta_key );
-        if ( ! empty( $value ) ) {
-            $courier_id = $value;
-            break;
+        $is_exported = $order->get_meta( '_rowsync_exported' );
+        
+        if ( $is_exported ) {
+            echo '<span class="button" style="background: #46b450; border-color: #46b450; color: #fff; cursor: default;">' . esc_html__( 'Exported ✓', 'rowsync' ) . '</span>';
+        } else {
+            $nonce = wp_create_nonce( 'rowsync_export_' . $order_id );
+            $url = admin_url( 'admin-post.php?action=rowsync_export_order&order_id=' . $order_id . '&_wpnonce=' . $nonce );
+            echo '<a href="' . esc_url( $url ) . '" class="button button-primary rowsync-export-btn">' . esc_html__( 'Export', 'rowsync' ) . '</a>';
         }
     }
 
-    // Order matters here -- must match your sheet's column order A->J
-    $data = [
-        'Order ID'         => (string) $order_id,
-        'Date'             => $order->get_date_created() ? $order->get_date_created()->date( 'Y-m-d H:i:s' ) : '',
-        'Customer Name'    => trim( $order->get_billing_first_name() . ' ' . $order->get_billing_last_name() ),
-        'Phone'            => $order->get_billing_phone(),
-        'Address'          => trim( $order->get_billing_address_1() . ' ' . $order->get_billing_address_2() . ', ' . $order->get_billing_city() ),
-        'Items & Quantity' => trim( $items_string, '; ' ),
-        'Order Notes'      => trim( $notes_string, ' |' ),
-        'Amount'           => (string) $order->get_total(),
-        'Delivery Charge'  => (string) $order->get_shipping_total(),
-        'Courier ID'       => (string) $courier_id,
-    ];
+    public function handle_export() {
+        if ( ! isset( $_GET['_wpnonce'] ) || ! wp_verify_nonce( sanitize_key( $_GET['_wpnonce'] ), 'rowsync_export_' . absint( $_GET['order_id'] ) ) ) {
+            wp_die( esc_html__( 'Security check failed.', 'rowsync' ) );
+        }
+        if ( ! current_user_can( 'edit_shop_orders' ) ) {
+            wp_die( esc_html__( 'You do not have permission to export orders.', 'rowsync' ) );
+        }
 
-    // 4. Send directly to Google Sheets
-    $result = rowsync_append_row_to_sheet( $data );
+        $order_id = absint( $_GET['order_id'] );
+        $order = wc_get_order( $order_id );
+        if ( ! $order ) wp_die( esc_html__( 'Order not found.', 'rowsync' ) );
 
-    // If Debug Mode is ON, show exactly what happened
-    if ( $is_debug ) {
-        echo '<div style="font-family:monospace; padding:20px; background:#fff; border:1px solid #ccc; margin:20px;">';
-        echo '<h2>' . esc_html__( 'Google Sheets API Debug Output', 'rowsync' ) . '</h2>';
-        echo '<h3>' . esc_html__( '1. Result:', 'rowsync' ) . '</h3><pre>' . ( is_wp_error( $result ) ? esc_html( $result->get_error_message() ) : 'SUCCESS' ) . '</pre>';
-        echo '<h3>' . esc_html__( '2. Row Sent:', 'rowsync' ) . '</h3><pre>' . esc_html( wp_json_encode( array_values( $data ), JSON_PRETTY_PRINT ) ) . '</pre>';
-        echo '<a href="' . esc_url( admin_url( 'edit.php?post_type=shop_order' ) ) . '" style="display:inline-block; padding:10px; background:#2271b1; color:#fff; text-decoration:none;">' . esc_html__( 'Back to Orders', 'rowsync' ) . '</a>';
-        echo '</div>';
+        if ( $order->get_meta( '_rowsync_exported' ) ) {
+            set_transient( 'rowsync_export_error', esc_html__( 'This order has already been exported.', 'rowsync' ), 30 );
+            wp_safe_redirect( wp_get_referer() );
+            exit;
+        }
+
+        $settings = get_option( 'rowsync_settings', array() );
+        $is_debug = isset( $settings['debug_mode'] ) ? (bool) $settings['debug_mode'] : false;
+
+        $data = $this->prepare_order_data( $order );
+        $result = $this->export_to_google_sheets( $data, $order );
+
+        if ( $is_debug ) {
+            $this->render_debug_output( $result, $data );
+            exit;
+        }
+
+        if ( is_wp_error( $result ) ) {
+            set_transient( 'rowsync_export_error', $result->get_error_message(), 30 );
+        } else {
+            $order->update_meta_data( '_rowsync_exported', current_time( 'mysql' ) );
+            $order->save();
+            set_transient( 'rowsync_export_success', 1, 30 );
+        }
+
+        wp_safe_redirect( wp_get_referer() );
         exit;
     }
 
-    // Normal flow (Debug OFF)
-    $referer = wp_get_referer() ? wp_get_referer() : admin_url( 'edit.php?post_type=shop_order' );
-    if ( is_wp_error( $result ) ) {
-        wp_safe_redirect( add_query_arg( 'rowsync_error', rawurlencode( $result->get_error_message() ), $referer ) );
-    } else {
-        wp_safe_redirect( add_query_arg( 'rowsync_success', '1', $referer ) );
-    }
-    exit;
-}
+    private function prepare_order_data( $order ) {
+        $settings = get_option( 'rowsync_settings', array() );
+        $courier_keys = isset( $settings['courier_meta_keys'] ) ? $settings['courier_meta_keys'] : '';
+        $keys_array = array_filter( array_map( 'trim', explode( ',', $courier_keys ) ) );
 
-// ==========================================
-// 5. SHOW NOTICES
-// ==========================================
-add_action( 'admin_notices', 'rowsync_export_notices' );
-function rowsync_export_notices() {
-    if ( isset( $_GET['rowsync_success'] ) && $_GET['rowsync_success'] == '1' ) {
-        echo '<div class="notice notice-success is-dismissible"><p><strong>' . esc_html__( 'Success!', 'rowsync' ) . '</strong> ' . esc_html__( 'Order data appended to your Google Sheet.', 'rowsync' ) . '</p></div>';
-    }
-    if ( isset( $_GET['rowsync_error'] ) ) {
-        $err = sanitize_text_field( wp_unslash( $_GET['rowsync_error'] ) );
-        echo '<div class="notice notice-error is-dismissible"><p><strong>' . esc_html__( 'Export Failed:', 'rowsync' ) . '</strong> ' . esc_html( $err ) . ' &mdash; ';
-        printf(
-            /* translators: %s: link to plugin settings page */
-            esc_html__( 'Turn on Debug Mode in %s for more detail.', 'rowsync' ),
-            '<a href="' . esc_url( admin_url( 'options-general.php?page=rowsync-settings' ) ) . '">' . esc_html__( 'plugin settings', 'rowsync' ) . '</a>'
+        $courier_id = '';
+        foreach ( $keys_array as $meta_key ) {
+            $value = $order->get_meta( $meta_key );
+            if ( empty( $value ) ) $value = get_post_meta( $order->get_id(), $meta_key, true );
+            if ( $value === '-' ) $value = ''; 
+            if ( ! empty( $value ) ) {
+                $courier_id = $value;
+                break;
+            }
+        }
+
+        $items_string = '';
+        foreach ( $order->get_items() as $item ) {
+            $items_string .= $item->get_name() . ' x' . $item->get_quantity() . '; ';
+        }
+
+        $notes_string = '';
+        $notes = wc_get_order_notes( array( 'order_id' => $order->get_id() ) );
+        foreach ( $notes as $note ) {
+            $notes_string .= wp_strip_all_tags( $note->content ) . ' | ';
+        }
+
+        return array(
+            'Order ID'         => (string) $order->get_id(),
+            'Date'             => $order->get_date_created() ? $order->get_date_created()->date( 'Y-m-d H:i:s' ) : '',
+            'Customer Name'    => trim( $order->get_billing_first_name() . ' ' . $order->get_billing_last_name() ),
+            'Phone'            => $order->get_billing_phone(),
+            'Address'          => trim( $order->get_billing_address_1() . ' ' . $order->get_billing_address_2() . ', ' . $order->get_billing_city() ),
+            'Items & Quantity' => trim( $items_string, '; ' ),
+            'Order Notes'      => trim( $notes_string, ' |' ),
+            'Amount (BDT)'     => (string) $order->get_total(),
+            'Delivery Charge'  => (string) $order->get_shipping_total(),
+            'Courier ID'       => (string) $courier_id,
         );
-        echo '</p></div>';
+    }
+
+    private function export_to_google_sheets( $data, $order ) {
+        $settings = get_option( 'rowsync_settings', array() );
+        $sheet_id = isset( $settings['sheet_id'] ) ? $settings['sheet_id'] : '';
+
+        if ( empty( $sheet_id ) ) return new WP_Error( 'no_sheet_id', esc_html__( 'Google Sheet ID not configured.', 'rowsync' ) );
+
+        $token = $this->get_google_access_token();
+        if ( is_wp_error( $token ) ) return $token;
+
+        $order_date = $order->get_date_created() ? $order->get_date_created()->date( 'Y-m-d' ) : current_time( 'Y-m-d' );
+        $sheet_name = $order_date;
+
+        $ensure_result = $this->ensure_sheet_with_headers( $sheet_id, $token, $sheet_name );
+        if ( is_wp_error( $ensure_result ) ) return $ensure_result;
+
+        $range = rawurlencode( "'" . $sheet_name . "'!A:J" );
+        $url = "https://sheets.googleapis.com/v4/spreadsheets/{$sheet_id}/values/{$range}:append";
+        $url .= '?valueInputOption=USER_ENTERED&insertDataOption=INSERT_ROWS';
+
+        $body = wp_json_encode( array( 'values' => array( array_values( $data ) ) ) );
+
+        $response = wp_remote_post( $url, array(
+            'method'  => 'POST',
+            'headers' => array( 'Content-Type' => 'application/json', 'Authorization' => 'Bearer ' . $token ),
+            'body'    => $body,
+            'timeout' => 15,
+        ) );
+
+        if ( is_wp_error( $response ) ) return $response;
+
+        $code = wp_remote_retrieve_response_code( $response );
+        if ( $code < 200 || $code >= 300 ) {
+            return new WP_Error( 'api_error', sprintf( esc_html__( 'Google Sheets API error: HTTP %d - %s', 'rowsync' ), $code, wp_remote_retrieve_body( $response ) ) );
+        }
+
+        return true;
+    }
+
+    private function ensure_sheet_with_headers( $sheet_id, $token, $sheet_name ) {
+        $url = "https://sheets.googleapis.com/v4/spreadsheets/{$sheet_id}?fields=sheets.properties.title";
+        $response = wp_remote_get( $url, array( 'headers' => array( 'Authorization' => 'Bearer ' . $token ), 'timeout' => 15 ) );
+
+        if ( is_wp_error( $response ) ) return $response;
+
+        $data = json_decode( wp_remote_retrieve_body( $response ), true );
+        $sheet_exists = false;
+
+        if ( isset( $data['sheets'] ) ) {
+            foreach ( $data['sheets'] as $sheet ) {
+                if ( isset( $sheet['properties']['title'] ) && $sheet['properties']['title'] === $sheet_name ) {
+                    $sheet_exists = true;
+                    break;
+                }
+            }
+        }
+
+        if ( ! $sheet_exists ) {
+            $create_url = "https://sheets.googleapis.com/v4/spreadsheets/{$sheet_id}:batchUpdate";
+            $create_body = wp_json_encode( array( 'requests' => array( array( 'addSheet' => array( 'properties' => array( 'title' => $sheet_name ) ) ) ) ) );
+
+            $create_response = wp_remote_post( $create_url, array(
+                'method'  => 'POST',
+                'headers' => array( 'Content-Type' => 'application/json', 'Authorization' => 'Bearer ' . $token ),
+                'body'    => $create_body,
+                'timeout' => 15,
+            ) );
+
+            if ( is_wp_error( $create_response ) ) return $create_response;
+            $create_code = wp_remote_retrieve_response_code( $create_response );
+            if ( $create_code < 200 || $create_code >= 300 ) return new WP_Error( 'create_sheet_error', esc_html__( 'Failed to create sheet.', 'rowsync' ) );
+        }
+
+        $headers = array( array( 'Order ID', 'Date', 'Customer Name', 'Phone', 'Address', 'Items & Quantity', 'Order Notes', 'Amount (BDT)', 'Delivery Charge', 'Courier ID' ) );
+
+        $check_url = "https://sheets.googleapis.com/v4/spreadsheets/{$sheet_id}/values/" . rawurlencode( "'" . $sheet_name . "'!A1" );
+        $check_response = wp_remote_get( $check_url, array( 'headers' => array( 'Authorization' => 'Bearer ' . $token ), 'timeout' => 15 ) );
+
+        $needs_headers = true;
+        if ( ! is_wp_error( $check_response ) ) {
+            $check_data = json_decode( wp_remote_retrieve_body( $check_response ), true );
+            if ( isset( $check_data['values'][0][0] ) && ! empty( $check_data['values'][0][0] ) ) $needs_headers = false;
+        }
+
+        if ( $needs_headers ) {
+            $header_url = "https://sheets.googleapis.com/v4/spreadsheets/{$sheet_id}/values/" . rawurlencode( "'" . $sheet_name . "'!A1" ) . '?valueInputOption=USER_ENTERED';
+            $header_response = wp_remote_request( $header_url, array(
+                'method'  => 'PUT',
+                'headers' => array( 'Content-Type' => 'application/json', 'Authorization' => 'Bearer ' . $token ),
+                'body'    => wp_json_encode( array( 'values' => $headers ) ),
+                'timeout' => 15,
+            ) );
+
+            if ( is_wp_error( $header_response ) ) return $header_response;
+            $header_code = wp_remote_retrieve_response_code( $header_response );
+            if ( $header_code < 200 || $header_code >= 300 ) return new WP_Error( 'header_error', esc_html__( 'Failed to add headers.', 'rowsync' ) );
+        }
+
+        return true;
+    }
+
+    private function get_google_access_token() {
+        $cached = get_transient( 'rowsync_google_access_token' );
+        if ( $cached ) return $cached;
+
+        $settings = get_option( 'rowsync_settings', array() );
+        $json_raw = isset( $settings['service_account_json'] ) ? $settings['service_account_json'] : '';
+
+        if ( empty( $json_raw ) ) return new WP_Error( 'no_json_key', esc_html__( 'Service account JSON not configured.', 'rowsync' ) );
+
+        $creds = json_decode( $json_raw, true );
+        
+        // Fallback: If json_decode fails, maybe the newlines were converted to real newlines in the DB?
+        if ( ! is_array( $creds ) ) {
+            $fixed_json = preg_replace( '/\r?\n/', '\\n', $json_raw );
+            $creds = json_decode( $fixed_json, true );
+        }
+
+        if ( ! is_array( $creds ) || empty( $creds['private_key'] ) || empty( $creds['client_email'] ) || empty( $creds['token_uri'] ) ) {
+            return new WP_Error( 'invalid_json', esc_html__( 'Invalid service account JSON. Please re-upload your JSON file.', 'rowsync' ) );
+        }
+
+        $now = time();
+        $header = array( 'alg' => 'RS256', 'typ' => 'JWT' );
+        $claims = array(
+            'iss'   => $creds['client_email'],
+            'scope' => 'https://www.googleapis.com/auth/spreadsheets',
+            'aud'   => $creds['token_uri'],
+            'exp'   => $now + 3600,
+            'iat'   => $now,
+        );
+
+        $segments = array(
+            $this->base64url_encode( wp_json_encode( $header ) ),
+            $this->base64url_encode( wp_json_encode( $claims ) ),
+        );
+        $signing_input = implode( '.', $segments );
+
+        $private_key_str = $creds['private_key'];
+        
+        // ==========================================
+        // BULLETPROOF KEY CLEANUP
+        // ==========================================
+        // 1. Remove any carriage returns (Windows line endings)
+        $private_key_str = str_replace( "\r", "", $private_key_str );
+        // 2. Convert literal \n to actual newlines
+        $private_key_str = str_replace( '\\n', "\n", $private_key_str );
+        // 3. Ensure it has the correct PEM headers
+        if ( strpos( $private_key_str, '-----BEGIN PRIVATE KEY-----' ) === false ) {
+            $private_key_str = "-----BEGIN PRIVATE KEY-----\n" . $private_key_str;
+        }
+        if ( strpos( $private_key_str, '-----END PRIVATE KEY-----' ) === false ) {
+            $private_key_str = $private_key_str . "\n-----END PRIVATE KEY-----\n";
+        }
+
+        $pkey = openssl_pkey_get_private( $private_key_str );
+
+        if ( ! $pkey ) {
+            return new WP_Error( 'invalid_key', esc_html__( 'Could not parse private key. Please re-upload your JSON file in settings.', 'rowsync' ) );
+        }
+
+        $signature = '';
+        if ( ! openssl_sign( $signing_input, $signature, $pkey, OPENSSL_ALGO_SHA256 ) ) {
+            return new WP_Error( 'sign_error', esc_html__( 'Failed to sign JWT.', 'rowsync' ) );
+        }
+
+        $jwt = $signing_input . '.' . $this->base64url_encode( $signature );
+
+        $response = wp_remote_post( $creds['token_uri'], array(
+            'method'  => 'POST',
+            'headers' => array( 'Content-Type' => 'application/x-www-form-urlencoded' ),
+            'body'    => array( 'grant_type' => 'urn:ietf:params:oauth:grant-type:jwt-bearer', 'assertion' => $jwt ),
+            'timeout' => 15,
+        ) );
+
+        if ( is_wp_error( $response ) ) return $response;
+
+        $code = wp_remote_retrieve_response_code( $response );
+        $body = json_decode( wp_remote_retrieve_body( $response ), true );
+
+        if ( $code < 200 || $code >= 300 || empty( $body['access_token'] ) ) {
+            $error_msg = isset( $body['error_description'] ) ? $body['error_description'] : wp_remote_retrieve_body( $response );
+            return new WP_Error( 'token_error', sprintf( esc_html__( 'Google API error: %s', 'rowsync' ), $error_msg ) );
+        }
+
+        $access_token = $body['access_token'];
+        $expires_in = isset( $body['expires_in'] ) ? (int) $body['expires_in'] : 3600;
+        set_transient( 'rowsync_google_access_token', $access_token, max( 60, $expires_in - 300 ) );
+
+        return $access_token;
+    }
+
+    private function base64url_encode( $data ) {
+        return rtrim( strtr( base64_encode( $data ), '+/', '-_' ), '=' );
+    }
+
+    private function render_debug_output( $result, $data ) {
+        ?>
+<div
+    style="font-family: monospace; padding: 20px; background: #fff; border: 1px solid #ccc; margin: 20px; max-width: 1000px;">
+    <h2><?php esc_html_e( 'Rowsync Debug Output', 'rowsync' ); ?></h2>
+    <h3><?php esc_html_e( 'Result:', 'rowsync' ); ?></h3>
+    <pre><?php echo esc_html( is_wp_error( $result ) ? $result->get_error_message() : 'SUCCESS' ); ?></pre>
+
+    <h3><?php esc_html_e( 'Data Sent:', 'rowsync' ); ?></h3>
+    <pre><?php echo esc_html( wp_json_encode( $data, JSON_PRETTY_PRINT ) ); ?></pre>
+
+    <a href="<?php echo esc_url( admin_url( 'edit.php?post_type=shop_order' ) ); ?>" class="button"
+        style="display: inline-block; padding: 10px; background: #2271b1; color: #fff; text-decoration: none;">
+        <?php esc_html_e( 'Back to Orders', 'rowsync' ); ?>
+    </a>
+</div>
+<?php
+    }
+
+    public function admin_notices() {
+        $success = get_transient( 'rowsync_export_success' );
+        if ( $success ) {
+            delete_transient( 'rowsync_export_success' );
+            ?>
+<div class="notice notice-success is-dismissible">
+    <p><strong><?php esc_html_e( 'Success!', 'rowsync' ); ?></strong>
+        <?php esc_html_e( 'Order exported to Google Sheets.', 'rowsync' ); ?></p>
+</div>
+<?php
+        }
+
+        $error = get_transient( 'rowsync_export_error' );
+        if ( $error ) {
+            delete_transient( 'rowsync_export_error' );
+            ?>
+<div class="notice notice-error is-dismissible">
+    <p><strong><?php esc_html_e( 'Export Failed:', 'rowsync' ); ?></strong> <?php echo esc_html( $error ); ?></p>
+</div>
+<?php
+        }
+    }
+
+    public function admin_scripts() {
+        ?>
+<style>
+.rowsync-export-btn.woosheet-loading {
+    background: #a7aaad !important;
+    border-color: #a7aaad !important;
+    color: #fff;
+    pointer-events: none;
+}
+</style>
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    document.querySelectorAll('.rowsync-export-btn').forEach(function(btn) {
+        btn.addEventListener('click', function(e) {
+            this.classList.add('woosheet-loading');
+            this.textContent = '<?php echo esc_js( __( 'Exporting...', 'rowsync' ) ); ?>';
+        });
+    });
+});
+</script>
+<?php
     }
 }
 
-// =A=========================================
-// 6. ACTIVATION CHECK
-// ==========================================
-register_activation_hook( __FILE__, 'rowsync_activation_check' );
-function rowsync_activation_check() {
-    if ( ! class_exists( 'WooCommerce' ) ) {
-        deactivate_plugins( plugin_basename( __FILE__ ) );
-        wp_die( esc_html__( 'Rowsync requires WooCommerce to be installed and active.', 'rowsync' ) );
-    }
-    if ( ! function_exists( 'openssl_sign' ) ) {
-        deactivate_plugins( plugin_basename( __FILE__ ) );
-        wp_die( esc_html__( 'Rowsync requires the PHP OpenSSL extension, which is not enabled on this server.', 'rowsync' ) );
-    }
+function rowsync_init() {
+    return Rowsync_Plugin::get_instance();
 }
-
-
-// ==========================================
-// 7. HPOS COMPATIBILITY DECLARATION (Required by WooCommerce)
-// ==========================================
-add_action( 'before_woocommerce_init', function() {
-    if ( class_exists( \Automattic\WooCommerce\Utilities\FeaturesUtil::class ) ) {
-        \Automattic\WooCommerce\Utilities\FeaturesUtil::declare_compatibility( 'custom_order_tables', __FILE__, true );
-    }
-} );
+rowsync_init();
