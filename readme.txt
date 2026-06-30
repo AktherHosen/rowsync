@@ -1,5 +1,5 @@
 === Rowsync - WooCommerce to Google Sheets Export ===
-Contributors: yourwordpressusername
+Contributors: akther1650
 Tags: woocommerce, google sheets, export, orders, excel, crm
 Requires at least: 6.0
 Tested up to: 6.5
