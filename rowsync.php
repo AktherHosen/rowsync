@@ -1,13 +1,15 @@
 <?php
 /**
- * Plugin Name: Rowsync - WooCommerce to Google Sheets
+ * Plugin Name: Rowsync
  * Plugin URI: https://wordpress.org/plugins/rowsync/
  * Description: Export WooCommerce orders directly to Google Sheets with one click. Automatically creates daily sheets and captures courier tracking IDs. No monthly fees or third-party services required.
  * Version: 1.0.3
  * Requires at least: 5.8
+ * Tested up to: 6.6
  * Requires PHP: 7.4
- * Author: Your Name
- * Author URI: https://yourwebsite.com
+ * Requires Plugins: woocommerce
+ * Author: Akther Hosen
+ * Author URI: https://github.com/AktherHosen
  * License: GPL v2 or later
  * License URI: https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain: rowsync

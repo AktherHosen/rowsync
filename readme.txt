@@ -1,9 +1,10 @@
-=== Rowsync - WooCommerce to Google Sheets ===
+=== Rowsync - Export Orders to Google Sheets for WooCommerce ===
 Contributors: akther1650
 Tags: woocommerce, google sheets, export, orders, automation, daily sheets, pathao, steadfast
 Requires at least: 5.8
-Tested up to: 6.5
+Tested up to: 6.6
 Requires PHP: 7.4
+Requires Plugins: woocommerce
 Stable tag: 1.0.3
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
@@ -14,7 +15,7 @@ Export WooCommerce orders directly to Google Sheets with one click. Automaticall
 
 Rowsync seamlessly connects your WooCommerce store to Google Sheets, allowing you to export order data with a single click. No monthly fees, no third-party connector services (like Zapier or SheetDB) — just a direct, secure integration using your own Google Cloud account.
 
-**🌟 Key Features:**
+**Key Features:**
 
 * **Bulletproof Key Parsing & File Upload:** Easily upload your Service Account JSON file directly. Our advanced parser automatically fixes hidden newline characters, ensuring your private key never breaks, even if security plugins are installed.
 * **Smart Duplicate Prevention:** Once an order is exported, Rowsync automatically flags it in your database. The export button instantly changes to a green **"Exported ✓"** badge, preventing accidental duplicate entries in your Google Sheet.
@@ -38,7 +39,7 @@ Perfect for store owners who want to automate order tracking, manage deliveries,
 5. Click the "Export" button on any WooCommerce order to export it to your Google Sheet.
 
 **How to get your Google Service Account JSON:**
-1. Go to the Google Cloud Console (https://console.cloud.google.com/).
+1. Go to the [Google Cloud Console](https://console.cloud.google.com/).
 2. Create a new Project (or select an existing one) and enable the **Google Sheets API**.
 3. Go to **IAM & Admin > Service Accounts**, create a new service account, and generate a JSON key.
 4. Download the JSON file.
