@@ -355,13 +355,23 @@ class Rowsync_Plugin {
         }
 
         $notes_string = '';
-        $notes = wc_get_order_notes( array( 'order_id' => $order->get_id() ) );
-        foreach ( $notes as $note ) {
-            if ( isset( $note->type ) && $note->type === 'customer' ) {
-                $notes_string .= wp_strip_all_tags( $note->content ) . ' | ';
-            }
+        
+        
+        $customer_note = $order->get_customer_note();
+        if ( ! empty( $customer_note ) ) {
+            $notes_string = wp_strip_all_tags( $customer_note );
         }
 
+        if ( empty( $notes_string ) ) {
+            $notes = wc_get_order_notes( array( 'order_id' => $order->get_id() ) );
+            foreach ( $notes as $note ) {
+                if ( isset( $note->type ) && $note->type !== 'system' ) {
+                    $notes_string .= wp_strip_all_tags( $note->content ) . ' | ';
+                }
+            }
+            $notes_string = trim( $notes_string, ' |' );
+        }
+        
         return array(
             'Order ID'         => (string) $order->get_id(),
             'Date'             => $order->get_date_created() ? $order->get_date_created()->date( 'Y-m-d H:i:s' ) : '',
