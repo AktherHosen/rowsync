@@ -1,6 +1,6 @@
 # Rowsync - WooCommerce to Google Sheets
 
-[![WordPress Plugin Version](https://img.shields.io/badge/version-1.0.3-blue.svg)](https://wordpress.org/plugins/rowsync/)
+[![WordPress Plugin Version](https://img.shields.io/badge/version-1.0.4-blue.svg)](https://wordpress.org/plugins/rowsync/)
 [![WordPress Tested](https://img.shields.io/badge/WordPress-v6.5%20tested-success.svg)](https://wordpress.org/)
 [![PHP Version](https://img.shields.io/badge/PHP-7.4%2B-orange.svg)](https://www.php.net/)
 [![License](https://img.shields.io/badge/license-GPLv2-green.svg)](https://www.gnu.org/licenses/gpl-2.0.html)
