@@ -72,6 +72,10 @@ Rowsync works with any courier plugin that stores tracking IDs in order meta. By
 
 ## 📝 Changelog
 
+### 1.0.4
+
+- Fixed inline JS/CSS enqueue, added external services documentation, and removed directory assets from zip.
+
 ### 1.0.3
 
 - Added Bulletproof Private Key Parser to automatically fix hidden newline and carriage return issues.
