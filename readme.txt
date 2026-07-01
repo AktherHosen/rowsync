@@ -5,7 +5,7 @@ Requires at least: 5.8
 Tested up to: 7.0
 Requires PHP: 7.4
 Requires Plugins: woocommerce
-Stable tag: 1.0.3
+Stable tag: 1.0.4
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -72,7 +72,22 @@ Absolutely. The connection is made directly from your server to Google's servers
 2. The WooCommerce orders list showing the one-click "Export" button and the green "Exported ✓" badge for completed orders.
 3. Example of automatically generated Daily Sheets in Google Sheets (e.g., 2026-07-01) with proper headers and order data.
 
+== External services ==
+
+This plugin connects directly to the Google Sheets API to export WooCommerce order data to the user's configured Google Sheet. 
+
+When the user clicks the "Export" button on an order, the plugin sends the following order data to Google Sheets: Order ID, Date, Customer Name, Phone, Address, Items & Quantity, Order Notes, Amount, Delivery Charge, and Courier Tracking ID.
+
+This connection is made directly from the user's WordPress server to Google's servers using the user's own Google Cloud Service Account credentials. No data is sent to any other third-party servers or intermediaries.
+
+This service is provided by Google LLC:
+- Google Terms of Service: https://policies.google.com/terms
+- Google Privacy Policy: https://policies.google.com/privacy
+
 == Changelog ==
+
+= 1.0.4 =
+* Fixed inline JS/CSS enqueue, added external services documentation, and removed directory assets from zip.
 
 = 1.0.3 =
 * Added Bulletproof Private Key Parser to automatically fix hidden newline and carriage return issues.
